@@ -5748,6 +5748,46 @@ class DFlashModel(Qwen3Model):
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
 
+        # DFlash-2 candidate selector metadata (absent on DFlash-1 drafts).
+        # The runtime uses these to size + drive the post-drafting rerank
+        # (see node/DFLASH2_PORT.md). Emitted only when the draft carries a
+        # selector, so DFlash-1 drafts are unaffected.
+        if "selector_rank" in dflash_config:
+            self.gguf_writer.add_uint32("dflash.selector_rank", int(dflash_config["selector_rank"]))
+        if "selector_top_k" in dflash_config:
+            self.gguf_writer.add_uint32("dflash.selector_top_k", int(dflash_config["selector_top_k"]))
+        # DFlash-2 per-sublayer grouped dynamic causal convolutions.
+        if "conv_kernel_size" in dflash_config:
+            self.gguf_writer.add_uint32("dflash.conv_kernel_size", int(dflash_config["conv_kernel_size"]))
+        if "conv_group_size" in dflash_config:
+            self.gguf_writer.add_uint32("dflash.conv_group_size", int(dflash_config["conv_group_size"]))
+
+    # DFlash-2 selector tensors have no entry in tensor_mapping, so route them
+    # to explicit GGUF names the runtime reads directly. HF names arrive as
+    # `model.candidate_selector.<part>.weight` (filter_tensors prepends model.).
+    _SELECTOR_NAMES = {
+        "predecessor_codebook": "dflash.selector.pred_codebook.weight",
+        "successor_codebook":   "dflash.selector.succ_codebook.weight",
+        "hidden_projection":    "dflash.selector.hidden_proj.weight",
+    }
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "candidate_selector." in name:
+            part = name.split("candidate_selector.")[-1].replace(".weight", "")
+            gguf_name = self._SELECTOR_NAMES.get(part)
+            if gguf_name is not None:
+                return [(gguf_name, data_torch)]
+            logger.warning(f"DFlash: skipping unmapped selector tensor {name!r}")
+            return []
+        # DFlash-2 per-layer dynamic convs: model.layers.N.{attention|mlp}_conv.{base_kernel|kernel_projection.weight}
+        m = re.search(r"layers\.(\d+)\.(attention_conv|mlp_conv)\.(base_kernel|kernel_projection\.weight)", name)
+        if m:
+            layer, mod, part = m.group(1), m.group(2), m.group(3)
+            tag = "attn" if mod == "attention_conv" else "mlp"
+            suffix = "base" if part == "base_kernel" else "proj.weight"
+            return [(f"blk.{layer}.dflash.{tag}_conv.{suffix}", data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
