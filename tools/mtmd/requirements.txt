@@ -1,5 +1,7 @@
 -r ../../requirements/requirements-convert_legacy_llama.txt
 --extra-index-url https://download.pytorch.org/whl/cpu
 pillow~=11.3.0
-torch~=2.6.0
-torchvision~=0.21.0
+# Floor raised from 2.6.0 for GHSA-covered torch memory-corruption/RCE fixes
+# (patched by 2.13.0); torchvision bumped to the paired release.
+torch>=2.13.0
+torchvision>=0.28.0
